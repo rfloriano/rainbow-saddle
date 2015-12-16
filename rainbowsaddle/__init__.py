@@ -1,5 +1,6 @@
 from __future__ import print_function
 
+import Queue
 import os
 import os.path as op
 import sys
@@ -30,6 +31,7 @@ def signal_handler(func):
 class RainbowSaddle(object):
 
     def __init__(self, options):
+        self.hup_queue = Queue.Queue()
         self._arbiter_pid = None
         self.stopped = False
         # Create a temporary file for the gunicorn pid file
@@ -45,7 +47,7 @@ class RainbowSaddle(object):
         process = subprocess.Popen(args)
         self.arbiter_pid = process.pid
         # Install signal handlers
-        signal.signal(signal.SIGHUP, self.restart_arbiter)
+        signal.signal(signal.SIGHUP, self.handle_hup)
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, self.stop)
 
@@ -60,6 +62,10 @@ class RainbowSaddle(object):
 
     def run_forever(self):
         while self.is_running():
+            if not self.hup_queue.empty():
+                with self.hup_queue.mutex:
+                    self.hup_queue.queue.clear()
+                self.restart_arbiter()
             time.sleep(1)
 
     def is_running(self):
@@ -67,15 +73,21 @@ class RainbowSaddle(object):
             return False
 
         # if gunicorn master is dead, rainbow-saddle is shutted down
-        pstatus = self.arbiter_process.status()
-        if pstatus != psutil.STATUS_RUNNING:
-            self.log('Gunicorn master is %s (PID: %s), shutting down '
-                     'rainbow-saddle' % (pstatus, self.arbiter_pid))
+        try:
+            pstatus = self.arbiter_process.status()
+            if pstatus != psutil.STATUS_RUNNING:
+                self.log('Gunicorn master is %s (PID: %s), shutting down '
+                         'rainbow-saddle' % (pstatus, self.arbiter_pid))
+                return False
+        except psutil.NoSuchProcess:
             return False
         return True
 
     @signal_handler
-    def restart_arbiter(self, signum, frame):
+    def handle_hup(self, signum, frame):
+        self.hup_queue.put((signum, frame))
+
+    def restart_arbiter(self):
         # Fork a new arbiter
         self.log('Starting new arbiter')
         os.kill(self.arbiter_pid, signal.SIGUSR2)
